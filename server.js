@@ -20,6 +20,29 @@ const MAX_BUFFER_SIZE = 20;
 let messageCount = 0;
 const MESSAGES_BEFORE_SUGGESTION = 15; // Generate suggestions every 15 messages
 
+// Keywords that indicate post-worthy content
+const TRIGGER_KEYWORDS = [
+  'product', 'feature', 'user', 'customer', 'growth', 'revenue',
+  'startup', 'building', 'learning', 'insight', 'problem', 'solution',
+  'team', 'hire', 'scale', 'launch', 'ship', 'metric', 'data',
+  'founder', 'business', 'strategy', 'idea', 'innovation'
+];
+
+// Usage statistics
+let stats = {
+  totalSuggestions: 0,
+  totalMessages: 0,
+  keywordMatches: 0,
+  lastSuggestionTime: null
+};
+
+// Check if message contains important keywords
+function containsRelevantKeywords(text) {
+  if (!text) return false;
+  const lowerText = text.toLowerCase();
+  return TRIGGER_KEYWORDS.some(keyword => lowerText.includes(keyword));
+}
+
 // Listen to ALL messages (with detailed logging)
 slackBot.event('message', async ({ event, say }) => {
   try {
@@ -44,11 +67,22 @@ slackBot.event('message', async ({ event, say }) => {
 
     console.log(`📨 Message received: "${event.text?.substring(0, 50)}..."`);
     
+    // Track stats
+    stats.totalMessages++;
+    
+    // Check if message contains relevant keywords
+    const hasKeywords = containsRelevantKeywords(event.text);
+    if (hasKeywords) {
+      console.log('🔑 Message contains relevant keywords!');
+      stats.keywordMatches++;
+    }
+    
     // Store message in buffer
     conversationBuffer.push({
       text: event.text,
       user: event.user,
-      timestamp: event.ts
+      timestamp: event.ts,
+      hasKeywords: hasKeywords
     });
 
     // Keep buffer size manageable
@@ -78,24 +112,62 @@ async function generatePostSuggestions(conversationText) {
     // Model: Meta-Llama-3-8B-Instruct (completely free, no rate limits for basic usage)
     const HF_API_URL = 'https://api-inference.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct';
     
-    const prompt = `You are a social media content strategist. Based on the following conversation snippets, suggest 2 LinkedIn posts and 2 X (Twitter) posts.
+    // Count messages with keywords
+    const relevantMessages = conversationBuffer.filter(msg => msg.hasKeywords).length;
+    const keywordContext = relevantMessages > 0 
+      ? `\n(${relevantMessages} messages contain product/business keywords - focus on these!)`
+      : '';
+    
+    const prompt = `You are a social media content strategist helping founders create authentic posts from their real conversations.
+
+Context: This is a conversation between co-founders discussing their startup.${keywordContext}
 
 Conversation:
 ${conversationText}
 
-Please provide:
-1. Two LinkedIn post ideas (professional, insightful, 100-200 words each)
-2. Two X post ideas (concise, engaging, under 280 characters each)
+Create engaging social media posts based on the MOST INTERESTING insights from this conversation:
 
-Format your response clearly with sections: LINKEDIN POST 1, LINKEDIN POST 2, X POST 1, X POST 2`;
+1. **LinkedIn Post 1** (150-250 words):
+   - Professional tone, share a learning or insight
+   - Start with a hook
+   - Add personal experience
+   - End with a question to engage readers
+
+2. **LinkedIn Post 2** (150-250 words):
+   - Different angle from Post 1
+   - Could be more tactical/how-to focused
+   - Include specific details or numbers if mentioned
+
+3. **X Post 1** (under 250 characters):
+   - Punchy, quotable insight
+   - Can use emojis strategically
+   - Should work standalone
+
+4. **X Post 2** (under 250 characters):
+   - Different topic from X Post 1
+   - Could be contrarian or thought-provoking
+   - Conversational tone
+
+Format EXACTLY like this:
+LINKEDIN POST 1:
+[post content]
+
+LINKEDIN POST 2:
+[post content]
+
+X POST 1:
+[post content]
+
+X POST 2:
+[post content]`;
 
     const response = await axios.post(
       HF_API_URL,
       {
         inputs: prompt,
         parameters: {
-          max_new_tokens: 800,
-          temperature: 0.7,
+          max_new_tokens: 1000,
+          temperature: 0.8,
           top_p: 0.95,
           return_full_text: false
         }
@@ -153,6 +225,10 @@ async function generateAndPostSuggestions(say, channel) {
     }
 
     console.log('🤖 Calling Hugging Face API...');
+    
+    // Track suggestion generation
+    stats.totalSuggestions++;
+    stats.lastSuggestionTime = new Date().toISOString();
     
     // Generate suggestions
     const suggestions = await generatePostSuggestions(conversationText);
@@ -273,13 +349,68 @@ slackBot.message('suggest posts', async ({ message, say }) => {
   await generateAndPostSuggestions(say, message.channel);
 });
 
+// Stats command
+slackBot.message('bot stats', async ({ say }) => {
+  const keywordPercent = stats.totalMessages > 0 
+    ? ((stats.keywordMatches / stats.totalMessages) * 100).toFixed(1)
+    : 0;
+  
+  await say({
+    blocks: [
+      {
+        type: 'header',
+        text: {
+          type: 'plain_text',
+          text: '📊 Bot Statistics',
+          emoji: true
+        }
+      },
+      {
+        type: 'section',
+        fields: [
+          {
+            type: 'mrkdwn',
+            text: `*Total Messages:*\n${stats.totalMessages}`
+          },
+          {
+            type: 'mrkdwn',
+            text: `*Suggestions Generated:*\n${stats.totalSuggestions}`
+          },
+          {
+            type: 'mrkdwn',
+            text: `*Keyword Matches:*\n${stats.keywordMatches} (${keywordPercent}%)`
+          },
+          {
+            type: 'mrkdwn',
+            text: `*Buffer Size:*\n${conversationBuffer.length}/${MAX_BUFFER_SIZE}`
+          },
+          {
+            type: 'mrkdwn',
+            text: `*Last Suggestion:*\n${stats.lastSuggestionTime || 'Never'}`
+          },
+          {
+            type: 'mrkdwn',
+            text: `*Next in:*\n${MESSAGES_BEFORE_SUGGESTION - messageCount} messages`
+          }
+        ]
+      }
+    ]
+  });
+});
+
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
     message: 'Slack Post Suggester Bot is active!',
-    bufferSize: conversationBuffer.length,
-    messagesUntilNextSuggestion: MESSAGES_BEFORE_SUGGESTION - messageCount
+    stats: {
+      totalMessages: stats.totalMessages,
+      totalSuggestions: stats.totalSuggestions,
+      keywordMatches: stats.keywordMatches,
+      bufferSize: conversationBuffer.length,
+      messagesUntilNext: MESSAGES_BEFORE_SUGGESTION - messageCount,
+      lastSuggestion: stats.lastSuggestionTime
+    }
   });
 });
 
