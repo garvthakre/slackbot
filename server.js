@@ -265,10 +265,7 @@ slackBot.event('reaction_added', async ({ event }) => {
   }
 });
 
-// ============================================
-// HEALTH CHECK
-// ============================================
-
+ 
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
