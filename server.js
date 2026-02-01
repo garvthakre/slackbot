@@ -14,81 +14,108 @@ const slackBot = new App({
   appToken: process.env.SLACK_APP_TOKEN,
 });
 
-// Store recent messages
+// Advanced conversation buffer with metadata
 let conversationBuffer = [];
-const MAX_BUFFER_SIZE = 20;
+const MAX_BUFFER_SIZE = 30;
 let messageCount = 0;
-const MESSAGES_BEFORE_SUGGESTION = 15;
+const MESSAGES_BEFORE_SUGGESTION = 12;
 
-// Keywords that indicate post-worthy content
-const TRIGGER_KEYWORDS = [
-  'product', 'feature', 'user', 'customer', 'growth', 'revenue',
-  'startup', 'building', 'learning', 'insight', 'problem', 'solution',
-  'team', 'hire', 'scale', 'launch', 'ship', 'metric', 'data',
-  'founder', 'business', 'strategy', 'idea', 'innovation'
-];
+// Cache for search results
+const searchCache = new Map();
+const CACHE_TTL = 3600000; // 1 hour
+
+// Enhanced keywords with categories
+const TOPIC_CATEGORIES = {
+  product: ['product', 'feature', 'mvp', 'launch', 'ship', 'build', 'design', 'ux', 'ui'],
+  growth: ['growth', 'user', 'customer', 'acquisition', 'retention', 'churn', 'conversion'],
+  metrics: ['revenue', 'arr', 'mrr', 'metric', 'kpi', 'data', 'analytics', 'dashboard'],
+  team: ['team', 'hire', 'hiring', 'culture', 'remote', 'management', 'leadership'],
+  startup: ['startup', 'founder', 'fundraising', 'pitch', 'investor', 'vc', 'seed'],
+  technical: ['api', 'code', 'deploy', 'infrastructure', 'scale', 'performance', 'bug'],
+  strategy: ['strategy', 'roadmap', 'vision', 'goal', 'okr', 'planning', 'execution'],
+  marketing: ['marketing', 'content', 'seo', 'brand', 'community', 'viral', 'organic']
+};
 
 // Usage statistics
 let stats = {
   totalSuggestions: 0,
   totalMessages: 0,
-  keywordMatches: 0,
+  categoryMatches: {},
   lastSuggestionTime: null,
-  postsUsed: 0
+  postsUsed: 0,
+  cacheHits: 0,
+  avgRelevanceScore: 0,
+  topTopics: {}
 };
 
-// Check if message contains important keywords
-function containsRelevantKeywords(text) {
-  if (!text) return false;
+Object.keys(TOPIC_CATEGORIES).forEach(cat => {
+  stats.categoryMatches[cat] = 0;
+});
+
+// Advanced keyword detection
+function analyzeMessage(text) {
+  if (!text) return { hasKeywords: false, categories: [], score: 0 };
+  
   const lowerText = text.toLowerCase();
-  return TRIGGER_KEYWORDS.some(keyword => lowerText.includes(keyword));
+  const matchedCategories = [];
+  let score = 0;
+  
+  Object.entries(TOPIC_CATEGORIES).forEach(([category, keywords]) => {
+    const matches = keywords.filter(kw => lowerText.includes(kw));
+    if (matches.length > 0) {
+      matchedCategories.push(category);
+      score += matches.length;
+      stats.categoryMatches[category]++;
+    }
+  });
+  
+  return {
+    hasKeywords: matchedCategories.length > 0,
+    categories: matchedCategories,
+    score: score
+  };
 }
 
-// Listen to ALL messages
+// Listen to messages
 slackBot.event('message', async ({ event, say }) => {
   try {
-    // Ignore bot messages and other subtypes
-    if (event.subtype && event.subtype === 'bot_message') {
-      return;
-    }
-    
-    if (event.subtype) {
-      return;
-    }
+    if (event.subtype || event.bot_id) return;
 
     console.log(`📨 Message received: "${event.text?.substring(0, 50)}..."`);
     
-    // Track stats
     stats.totalMessages++;
+    const analysis = analyzeMessage(event.text);
     
-    // Check if message contains relevant keywords
-    const hasKeywords = containsRelevantKeywords(event.text);
-    if (hasKeywords) {
-      console.log('🔑 Message contains relevant keywords!');
-      stats.keywordMatches++;
-    }
-    
-    // Store message in buffer
     conversationBuffer.push({
       text: event.text,
       user: event.user,
       timestamp: event.ts,
-      hasKeywords: hasKeywords
+      analysis: analysis,
+      addedAt: Date.now()
     });
 
-    // Keep buffer size manageable
     if (conversationBuffer.length > MAX_BUFFER_SIZE) {
+      conversationBuffer.sort((a, b) => {
+        const scoreA = a.analysis.score || 0;
+        const scoreB = b.analysis.score || 0;
+        const ageA = Date.now() - a.addedAt;
+        const ageB = Date.now() - b.addedAt;
+        return (scoreB / ageB) - (scoreA / ageA);
+      });
       conversationBuffer.shift();
     }
 
     messageCount++;
-    console.log(`📊 Message count: ${messageCount}/${MESSAGES_BEFORE_SUGGESTION}`);
+    const totalScore = conversationBuffer.reduce((sum, msg) => sum + (msg.analysis.score || 0), 0);
+    
+    console.log(`📊 Messages: ${messageCount}/${MESSAGES_BEFORE_SUGGESTION} | Relevance: ${totalScore}`);
 
-    // Generate suggestions every N messages
-    if (messageCount >= MESSAGES_BEFORE_SUGGESTION) {
-      console.log('🎯 Triggering post suggestions...');
+    const shouldTrigger = messageCount >= MESSAGES_BEFORE_SUGGESTION || totalScore >= 20;
+
+    if (shouldTrigger) {
+      console.log('🎯 Triggering smart post suggestions...');
       messageCount = 0;
-      await findSimilarPosts(say, event.channel);
+      await findSimilarPostsAdvanced(say, event.channel);
     }
 
   } catch (error) {
@@ -96,27 +123,35 @@ slackBot.event('message', async ({ event, say }) => {
   }
 });
 
-// Extract topics from conversation using AI
-async function extractTopics(conversationText) {
+// FIXED: Better topic extraction with fallback
+async function extractTopicsAdvanced(conversationText, categories) {
   try {
-    const HF_API_URL = 'https://api-inference.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct';
+    // Use a different, more reliable Hugging Face model
+    const HF_API_URL = 'https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2';
     
-    const prompt = `Analyze this conversation between co-founders and extract 3-5 key topics or themes they're discussing.
+    const categoryContext = categories.length > 0 
+      ? `Main categories: ${categories.join(', ')}`
+      : '';
+    
+    const prompt = `Extract 3-4 specific searchable topics from this startup conversation.
+
+${categoryContext}
 
 Conversation:
-${conversationText}
+${conversationText.substring(0, 800)}
 
-Return ONLY a JSON array of topics (no other text):
+Return ONLY a JSON array of topics:
 ["topic 1", "topic 2", "topic 3"]
 
-Topics should be specific search queries that would find relevant LinkedIn or X posts.`;
+Examples:
+["B2B SaaS pricing optimization", "user onboarding metrics", "product-led growth strategies"]`;
 
     const response = await axios.post(
       HF_API_URL,
       {
         inputs: prompt,
         parameters: {
-          max_new_tokens: 200,
+          max_new_tokens: 150,
           temperature: 0.3,
           return_full_text: false
         }
@@ -125,113 +160,149 @@ Topics should be specific search queries that would find relevant LinkedIn or X 
         headers: {
           'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 15000
       }
     );
 
-    const responseText = response.data[0].generated_text.trim();
+    const responseText = response.data[0]?.generated_text?.trim() || '';
+    const jsonMatch = responseText.match(/\[[\s\S]*?\]/);
     
-    // Try to extract JSON array from response
-    const jsonMatch = responseText.match(/\[.*\]/s);
     if (jsonMatch) {
       const topics = JSON.parse(jsonMatch[0]);
-      return topics.slice(0, 5); // Max 5 topics
+      return topics.slice(0, 4);
     }
     
-    // Fallback: extract keywords from conversation
-    return extractKeywordsFromText(conversationText);
+    throw new Error('No JSON found in response');
     
   } catch (error) {
-    console.error('Error extracting topics:', error);
-    return extractKeywordsFromText(conversationText);
+    console.error('Error extracting topics:', error.message);
+    return createFallbackTopics(conversationText, categories);
   }
 }
 
-// Fallback method to extract keywords
-function extractKeywordsFromText(text) {
-  const words = text.toLowerCase().split(/\s+/);
-  const keywords = words.filter(word => 
-    TRIGGER_KEYWORDS.includes(word) && word.length > 4
-  );
+// Fallback topic generation
+function createFallbackTopics(text, categories) {
+  const topics = [];
   
-  // Get unique keywords and take top 3
-  const uniqueKeywords = [...new Set(keywords)];
-  return uniqueKeywords.slice(0, 3).map(k => `${k} startup`);
+  // Use categories with common startup terms
+  if (categories.length > 0) {
+    topics.push(...categories.map(cat => `${cat} for startups`));
+  }
+  
+  // Extract meaningful phrases
+  const words = text.toLowerCase().split(/\s+/);
+  const commonWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by']);
+  
+  for (let i = 0; i < words.length - 2; i++) {
+    const phrase = [words[i], words[i+1], words[i+2]]
+      .filter(w => !commonWords.has(w) && w.length > 3)
+      .join(' ');
+    
+    if (phrase.length > 10 && phrase.length < 50) {
+      topics.push(phrase);
+    }
+  }
+  
+  return [...new Set(topics)].slice(0, 4);
 }
 
-// Search for posts on multiple platforms
-async function searchPosts(topic) {
-  const results = {
-    linkedin: [],
-    x: []
-  };
+// Search with caching
+async function searchPostsWithCache(topic) {
+  const cacheKey = topic.toLowerCase();
+  const cached = searchCache.get(cacheKey);
+  
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    console.log(`💾 Cache hit for: ${topic}`);
+    stats.cacheHits++;
+    return cached.results;
+  }
+
+  console.log(`🔍 Searching (cache miss): ${topic}`);
+  
+  const results = { linkedin: [], x: [] };
 
   try {
-    // Search LinkedIn using Google (since LinkedIn API is restricted)
-    const linkedinQuery = encodeURIComponent(`site:linkedin.com/posts ${topic}`);
-    const linkedinResults = await searchGoogle(linkedinQuery, 'LinkedIn');
-    results.linkedin = linkedinResults;
+    const [linkedinResults, xResults] = await Promise.all([
+      searchPlatform(topic, 'LinkedIn'),
+      searchPlatform(topic, 'X')
+    ]);
 
-    // Search X/Twitter
-    const xQuery = encodeURIComponent(`site:twitter.com OR site:x.com ${topic}`);
-    const xResults = await searchGoogle(xQuery, 'X/Twitter');
+    results.linkedin = linkedinResults;
     results.x = xResults;
 
+    searchCache.set(cacheKey, {
+      results: results,
+      timestamp: Date.now()
+    });
+
   } catch (error) {
-    console.error('Error searching posts:', error);
+    console.error('Error searching posts:', error.message);
   }
 
   return results;
 }
 
-// Use Google Custom Search API or SerpAPI to find posts
-async function searchGoogle(query, platform) {
+// Platform search
+async function searchPlatform(topic, platform) {
   try {
-    // Option 1: Using SerpAPI (free tier available)
+    let query, siteFilter;
+    
+    if (platform === 'LinkedIn') {
+      siteFilter = 'site:linkedin.com/posts';
+      query = `${siteFilter} ${topic} startup`;
+    } else {
+      siteFilter = 'site:x.com OR site:twitter.com';
+      query = `${siteFilter} ${topic}`;
+    }
+
     if (process.env.SERPAPI_KEY) {
       const response = await axios.get('https://serpapi.com/search', {
         params: {
           q: query,
           api_key: process.env.SERPAPI_KEY,
-          num: 3 // Get top 3 results
-        }
+          num: 5,
+          engine: 'google'
+        },
+        timeout: 10000
       });
 
-      return response.data.organic_results?.slice(0, 3).map(result => ({
-        title: result.title,
-        snippet: result.snippet,
+      return (response.data.organic_results || []).slice(0, 5).map(result => ({
+        title: result.title.substring(0, 100),
+        snippet: (result.snippet || '').substring(0, 150),
         url: result.link,
-        platform: platform
-      })) || [];
+        platform: platform,
+        relevance: calculateRelevanceScore(result.title, result.snippet, topic)
+      }));
     }
 
-    // Option 2: Using Google Custom Search API
     if (process.env.GOOGLE_SEARCH_API_KEY && process.env.GOOGLE_SEARCH_ENGINE_ID) {
       const response = await axios.get('https://www.googleapis.com/customsearch/v1', {
         params: {
           key: process.env.GOOGLE_SEARCH_API_KEY,
           cx: process.env.GOOGLE_SEARCH_ENGINE_ID,
           q: query,
-          num: 3
-        }
+          num: 5
+        },
+        timeout: 10000
       });
 
-      return response.data.items?.slice(0, 3).map(item => ({
-        title: item.title,
-        snippet: item.snippet,
+      return (response.data.items || []).slice(0, 5).map(item => ({
+        title: item.title.substring(0, 100),
+        snippet: (item.snippet || '').substring(0, 150),
         url: item.link,
-        platform: platform
-      })) || [];
+        platform: platform,
+        relevance: calculateRelevanceScore(item.title, item.snippet, topic)
+      }));
     }
 
-    // Fallback: Return generic search links
+    const encodedQuery = encodeURIComponent(query);
     return [{
-      title: `Search ${platform} for: ${decodeURIComponent(query)}`,
-      snippet: 'Click to search for similar posts',
-      url: platform === 'LinkedIn' 
-        ? `https://www.linkedin.com/search/results/content/?keywords=${query}`
-        : `https://twitter.com/search?q=${query}`,
-      platform: platform
+      title: `Search ${platform} for: ${topic.substring(0, 50)}`,
+      snippet: 'Click to find posts about this topic',
+      url: `https://www.google.com/search?q=${encodedQuery}`,
+      platform: platform,
+      relevance: 0
     }];
 
   } catch (error) {
@@ -240,280 +311,282 @@ async function searchGoogle(query, platform) {
   }
 }
 
-// Find and suggest similar posts
-async function findSimilarPosts(say, channel) {
-  try {
-    console.log('🔄 Finding similar posts...');
-    
-    // Combine recent messages into conversation text
-    const conversationText = conversationBuffer
-      .map(msg => msg.text)
-      .filter(text => text)
-      .join('\n');
+// Calculate relevance
+function calculateRelevanceScore(title, snippet, topic) {
+  const text = `${title} ${snippet}`.toLowerCase();
+  const topicWords = topic.toLowerCase().split(/\s+/);
+  
+  let score = 0;
+  
+  if (text.includes(topic.toLowerCase())) score += 10;
+  
+  topicWords.forEach(word => {
+    if (word.length > 3 && text.includes(word)) score += 2;
+  });
+  
+  const boostWords = ['founder', 'startup', 'built', 'learned', 'growth', 'metric'];
+  boostWords.forEach(word => {
+    if (text.includes(word)) score += 1;
+  });
+  
+  return score;
+}
 
-    if (conversationText.length < 10) {
-      await say('⚠️ Not enough conversation history yet. Send a few more messages first!');
+// Main search function
+async function findSimilarPostsAdvanced(say, channel) {
+  try {
+    console.log('🔄 Starting advanced post search...');
+    
+    await say('🤖 Analyzing your conversation...');
+    
+    const relevantMessages = conversationBuffer
+      .filter(msg => msg.analysis.score > 0)
+      .sort((a, b) => b.analysis.score - a.analysis.score)
+      .slice(0, 15);
+    
+    if (relevantMessages.length === 0) {
+      await say('⚠️ Not enough relevant content. Discuss product, growth, or startup topics!');
       return;
     }
 
-    await say('🔍 Analyzing your conversation and finding similar posts...');
+    const conversationText = relevantMessages.map(msg => msg.text).join('\n');
+    const allCategories = [...new Set(relevantMessages.flatMap(msg => msg.analysis.categories))];
 
-    // Extract topics from conversation
-    console.log('📊 Extracting topics...');
-    const topics = await extractTopics(conversationText);
-    console.log('Topics extracted:', topics);
+    console.log(`📊 Detected categories: ${allCategories.join(', ')}`);
 
-    // Track suggestion generation
+    const topics = await extractTopicsAdvanced(conversationText, allCategories);
+    console.log(`🎯 Topics extracted: ${topics.join(', ')}`);
+    
+    topics.forEach(topic => {
+      stats.topTopics[topic] = (stats.topTopics[topic] || 0) + 1;
+    });
+
     stats.totalSuggestions++;
     stats.lastSuggestionTime = new Date().toISOString();
 
-    // Search for posts on each topic
-    const allResults = {
-      linkedin: [],
-      x: []
-    };
+    await say('🔍 Searching for relevant posts...');
 
-    for (const topic of topics) {
-      console.log(`🔍 Searching for: ${topic}`);
-      const results = await searchPosts(topic);
-      allResults.linkedin.push(...results.linkedin);
-      allResults.x.push(...results.x);
-    }
+    const allSearches = await Promise.all(
+      topics.map(topic => searchPostsWithCache(topic))
+    );
 
-    // Remove duplicates
-    allResults.linkedin = removeDuplicates(allResults.linkedin);
-    allResults.x = removeDuplicates(allResults.x);
+    const allPosts = { linkedin: [], x: [] };
 
-    console.log(`Found ${allResults.linkedin.length} LinkedIn posts, ${allResults.x.length} X posts`);
-
-    // Build formatted message
-    let formattedMessage = `*Based on your discussion about:* ${topics.join(', ')}\n\n`;
-    
-    if (allResults.linkedin.length > 0) {
-      formattedMessage += '*📘 SIMILAR LINKEDIN POSTS*\n\n';
-      allResults.linkedin.slice(0, 5).forEach((post, index) => {
-        formattedMessage += `${index + 1}. *${post.title}*\n`;
-        formattedMessage += `   ${post.snippet}\n`;
-        formattedMessage += `   🔗 <${post.url}|View Post>\n\n`;
-      });
-    }
-
-    if (allResults.x.length > 0) {
-      formattedMessage += '*🐦 SIMILAR X/TWITTER POSTS*\n\n';
-      allResults.x.slice(0, 5).forEach((post, index) => {
-        formattedMessage += `${index + 1}. *${post.title}*\n`;
-        formattedMessage += `   ${post.snippet}\n`;
-        formattedMessage += `   🔗 <${post.url}|View Post>\n\n`;
-      });
-    }
-
-    if (allResults.linkedin.length === 0 && allResults.x.length === 0) {
-      formattedMessage += '_No similar posts found. Try discussing more specific topics!_';
-    }
-
-    // Post to Slack
-    await say({
-      blocks: [
-        {
-          type: 'header',
-          text: {
-            type: 'plain_text',
-            text: '🔍 Similar Posts Found!',
-            emoji: true
-          }
-        },
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: formattedMessage
-          }
-        },
-        {
-          type: 'divider'
-        },
-        {
-          type: 'context',
-          elements: [
-            {
-              type: 'mrkdwn',
-              text: '_💡 These posts discuss similar topics to your conversation. Click to read and get inspired!_'
-            }
-          ]
-        }
-      ]
+    allSearches.forEach(results => {
+      allPosts.linkedin.push(...results.linkedin);
+      allPosts.x.push(...results.x);
     });
 
-    console.log('✅ Posted suggestions to Slack');
+    allPosts.linkedin = removeDuplicatesAndRank(allPosts.linkedin);
+    allPosts.x = removeDuplicatesAndRank(allPosts.x);
+
+    const allRelevance = [...allPosts.linkedin, ...allPosts.x].map(p => p.relevance || 0);
+    stats.avgRelevanceScore = allRelevance.length > 0 
+      ? (allRelevance.reduce((a, b) => a + b, 0) / allRelevance.length).toFixed(2)
+      : 0;
+
+    console.log(`✅ Found ${allPosts.linkedin.length} LinkedIn, ${allPosts.x.length} X posts`);
+
+    await sendAdvancedResults(say, topics, allCategories, allPosts);
+
   } catch (error) {
     console.error('❌ Error finding posts:', error);
-    await say(`❌ Error finding similar posts: ${error.message}`);
+    await say(`❌ Error: ${error.message}`);
   }
 }
 
-// Remove duplicate URLs
-function removeDuplicates(posts) {
+// Remove duplicates and rank
+function removeDuplicatesAndRank(posts) {
   const seen = new Set();
-  return posts.filter(post => {
-    if (seen.has(post.url)) {
-      return false;
-    }
+  const unique = posts.filter(post => {
+    if (seen.has(post.url)) return false;
     seen.add(post.url);
     return true;
   });
+  
+  return unique.sort((a, b) => (b.relevance || 0) - (a.relevance || 0));
 }
 
-// Manual trigger command
-slackBot.command('/suggest-posts', async ({ command, ack, respond }) => {
-  try {
-    await ack();
-    console.log('🎯 Manual trigger: /suggest-posts command received');
-    
-    const conversationText = conversationBuffer
-      .map(msg => msg.text)
-      .filter(text => text)
-      .join('\n');
-    
-    if (conversationText.length < 10) {
-      await respond({
-        response_type: 'in_channel',
-        text: '⚠️ Not enough conversation history yet. Send a few more messages first!'
-      });
-      return;
-    }
-
-    await respond({
-      response_type: 'in_channel',
-      text: '🔍 Searching for similar posts...'
-    });
-
-    // Trigger the search (this will post results separately)
-    await findSimilarPosts(respond, command.channel_id);
-    
-  } catch (error) {
-    console.error('❌ Error handling slash command:', error);
-    await respond({
-      response_type: 'ephemeral',
-      text: `❌ Error: ${error.message}`
-    });
-  }
-});
-
-// Also allow triggering with a simple message
-slackBot.message('suggest posts', async ({ message, say }) => {
-  console.log('🎯 Manual trigger: "suggest posts" message received');
-  await findSimilarPosts(say, message.channel);
-});
-
-slackBot.message('find similar posts', async ({ message, say }) => {
-  console.log('🎯 Manual trigger: "find similar posts" message received');
-  await findSimilarPosts(say, message.channel);
-});
-
-// Stats command
-slackBot.message('bot stats', async ({ say }) => {
-  await sendStatsMessage(say);
-});
-
-// Track reactions
-slackBot.event('reaction_added', async ({ event }) => {
-  try {
-    if (event.reaction === '+1' || event.reaction === 'thumbsup') {
-      stats.postsUsed++;
-      console.log(`👍 Post marked as used! Total used: ${stats.postsUsed}`);
-    }
-  } catch (error) {
-    console.error('Error tracking reaction:', error);
-  }
-});
-
-// Helper function to send stats
-async function sendStatsMessage(say) {
-  const keywordPercent = stats.totalMessages > 0 
-    ? ((stats.keywordMatches / stats.totalMessages) * 100).toFixed(1)
-    : 0;
+// FIXED: Better Slack formatting to avoid 500 error
+async function sendAdvancedResults(say, topics, categories, posts) {
+  const topicsList = topics.slice(0, 3).join(', ');
+  const categoriesList = categories.slice(0, 3).join(', ');
   
-  const usageRate = stats.totalSuggestions > 0
-    ? ((stats.postsUsed / stats.totalSuggestions) * 100).toFixed(1)
-    : 0;
+  // FIXED: Split into smaller messages to avoid Slack payload limits
   
+  // Header message
   await say({
     blocks: [
       {
         type: 'header',
         text: {
           type: 'plain_text',
-          text: '📊 Bot Statistics',
+          text: '🎯 Smart Post Recommendations',
           emoji: true
         }
       },
       {
         type: 'section',
-        fields: [
-          {
-            type: 'mrkdwn',
-            text: `*Total Messages:*\n${stats.totalMessages}`
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Searches Performed:*\n${stats.totalSuggestions}`
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Posts Used:* 👍\n${stats.postsUsed} (${usageRate}% usage)`
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Keyword Matches:*\n${stats.keywordMatches} (${keywordPercent}%)`
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Buffer Size:*\n${conversationBuffer.length}/${MAX_BUFFER_SIZE}`
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Next Search in:*\n${MESSAGES_BEFORE_SUGGESTION - messageCount} messages`
-          }
-        ]
+        text: {
+          type: 'mrkdwn',
+          text: `*Your conversation covered:* ${categoriesList}\n*Key topics:* ${topicsList}`
+        }
       },
       {
+        type: 'divider'
+      }
+    ]
+  });
+
+  // LinkedIn posts (max 3 at a time to avoid payload issues)
+  if (posts.linkedin.length > 0) {
+    const linkedinPosts = posts.linkedin.slice(0, 3);
+    const blocks = [{
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '*📘 TOP LINKEDIN POSTS*'
+      }
+    }];
+
+    linkedinPosts.forEach((post, idx) => {
+      const stars = getRelevanceStars(post.relevance);
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `${idx + 1}. ${stars} *${post.title}*\n${post.snippet}\n<${post.url}|Read Post>`
+        }
+      });
+    });
+
+    await say({ blocks });
+  }
+
+  // X posts (max 3 at a time)
+  if (posts.x.length > 0) {
+    const xPosts = posts.x.slice(0, 3);
+    const blocks = [{
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '*🐦 TOP X/TWITTER POSTS*'
+      }
+    }];
+
+    xPosts.forEach((post, idx) => {
+      const stars = getRelevanceStars(post.relevance);
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `${idx + 1}. ${stars} *${post.title}*\n${post.snippet}\n<${post.url}|Read Post>`
+        }
+      });
+    });
+
+    await say({ blocks });
+  }
+
+  // Summary
+  await say({
+    blocks: [
+      {
         type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text: `_Last search: ${stats.lastSuggestionTime ? new Date(stats.lastSuggestionTime).toLocaleString() : 'Never'}_`
-          }
-        ]
+        elements: [{
+          type: 'mrkdwn',
+          text: `💡 *${posts.linkedin.length + posts.x.length} posts found* | Ranked by relevance | React 👍 if useful`
+        }]
       }
     ]
   });
 }
 
-// Health check endpoint
+function getRelevanceStars(score) {
+  if (score >= 15) return '⭐⭐⭐';
+  if (score >= 8) return '⭐⭐';
+  if (score >= 4) return '⭐';
+  return '';
+}
+
+// Manual triggers
+slackBot.command('/suggest-posts', async ({ command, ack, say }) => {
+  await ack();
+  await findSimilarPostsAdvanced(say, command.channel_id);
+});
+
+slackBot.message(/^(suggest posts|find posts|show posts)/i, async ({ message, say }) => {
+  await findSimilarPostsAdvanced(say, message.channel);
+});
+
+// Stats
+slackBot.message('bot stats', async ({ say }) => {
+  const topCategories = Object.entries(stats.categoryMatches)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([cat, count]) => `${cat}: ${count}`)
+    .join(', ');
+
+  const topTopicsList = Object.entries(stats.topTopics)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([topic, count]) => `"${topic.substring(0, 40)}..." (${count}x)`)
+    .join('\n');
+
+  await say({
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: '📊 Bot Statistics', emoji: true }
+      },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*Messages:* ${stats.totalMessages}` },
+          { type: 'mrkdwn', text: `*Searches:* ${stats.totalSuggestions}` },
+          { type: 'mrkdwn', text: `*Cache Hits:* ${stats.cacheHits}` },
+          { type: 'mrkdwn', text: `*Avg Relevance:* ${stats.avgRelevanceScore}` },
+          { type: 'mrkdwn', text: `*Top Categories:*\n${topCategories}` },
+          { type: 'mrkdwn', text: `*Buffer:* ${conversationBuffer.length}/${MAX_BUFFER_SIZE}` }
+        ]
+      }
+    ]
+  });
+});
+
+// Track reactions
+slackBot.event('reaction_added', async ({ event }) => {
+  if (event.reaction === '+1' || event.reaction === 'thumbsup') {
+    stats.postsUsed++;
+  }
+});
+
+// Clear cache
+slackBot.message('clear cache', async ({ say }) => {
+  searchCache.clear();
+  await say('✅ Cache cleared!');
+});
+
+// Health check
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
-    message: 'Slack Similar Post Finder Bot is active!',
+    version: '2.0 - Fixed',
     stats: {
-      totalMessages: stats.totalMessages,
-      totalSearches: stats.totalSuggestions,
-      postsUsed: stats.postsUsed,
-      keywordMatches: stats.keywordMatches,
-      bufferSize: conversationBuffer.length,
-      messagesUntilNext: MESSAGES_BEFORE_SUGGESTION - messageCount,
-      lastSearch: stats.lastSuggestionTime
+      ...stats,
+      cacheSize: searchCache.size,
+      bufferSize: conversationBuffer.length
     }
   });
 });
 
-// Start the Slack bot
+// Start
 (async () => {
   await slackBot.start();
-  console.log('⚡️ Slack bot is running!');
-  console.log('🔍 Will search for similar posts based on your conversations');
+  console.log('⚡️ Advanced Slack bot is running!');
+  console.log('🧠 Features: AI topic extraction, relevance ranking, smart caching');
 })();
 
-// Start Express server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
