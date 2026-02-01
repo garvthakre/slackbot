@@ -1,229 +1,295 @@
 require('dotenv').config();
 const express = require('express');
-const bodyParser = require('body-parser');
-const { WebClient } = require('@slack/web-api');
-const { createEventAdapter } = require('@slack/events-api');
-const cron = require('node-cron');
-const { generatePostSuggestions } = require('./services/claudeService');
-const { conversationBuffer } = require('./utils/messageBuffer');
+const { App } = require('@slack/bolt');
+const axios = require('axios');
 
 const app = express();
-const slackEvents = createEventAdapter(process.env.SLACK_SIGNING_SECRET);
-const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-
 const PORT = process.env.PORT || 3000;
-const CHANNEL_ID = process.env.SLACK_CHANNEL_ID;
 
-// Middleware
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-
-// Mount Slack events at /slack/events
-app.use('/slack/events', slackEvents.expressMiddleware());
-
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'running',
-    bufferSize: conversationBuffer.getMessages().length,
-    lastCheck: conversationBuffer.getLastCheckTime()
-  });
+// Slack Bot Setup
+const slackBot = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  socketMode: true, // Enable socket mode for easier development (no public URL needed)
+  appToken: process.env.SLACK_APP_TOKEN,
 });
 
-// Manual trigger endpoint for testing
-app.post('/trigger-suggestions', async (req, res) => {
+// Store recent messages (in production, use Redis or MongoDB)
+let conversationBuffer = [];
+const MAX_BUFFER_SIZE = 20;
+let messageCount = 0;
+const MESSAGES_BEFORE_SUGGESTION = 15; // Generate suggestions every 15 messages
+
+// Listen to ALL messages (with detailed logging)
+slackBot.event('message', async ({ event, say }) => {
   try {
-    const messages = conversationBuffer.getMessages();
+    console.log('🔔 RAW MESSAGE EVENT RECEIVED!');
+    console.log('Event type:', event.type);
+    console.log('Event subtype:', event.subtype);
+    console.log('Event channel:', event.channel);
+    console.log('Event user:', event.user);
+    console.log('Event text:', event.text);
+    console.log('Full event:', JSON.stringify(event, null, 2));
     
-    if (messages.length === 0) {
-      return res.json({ message: 'No messages in buffer yet' });
+    // Ignore bot messages and other subtypes
+    if (event.subtype && event.subtype === 'bot_message') {
+      console.log('🤖 Ignoring bot message');
+      return;
+    }
+    
+    if (event.subtype) {
+      console.log(`⚠️ Ignoring message with subtype: ${event.subtype}`);
+      return;
     }
 
-    const suggestions = await generatePostSuggestions(messages);
+    console.log(`📨 Message received: "${event.text?.substring(0, 50)}..."`);
     
-    await slackClient.chat.postMessage({
-      channel: CHANNEL_ID,
-      text: '📝 *Content Suggestions*',
-      blocks: formatSuggestionsMessage(suggestions)
-    });
-
-    conversationBuffer.clear();
-    
-    res.json({ 
-      success: true, 
-      messagesProcessed: messages.length,
-      suggestions 
-    });
-  } catch (error) {
-    console.error('Error triggering suggestions:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Listen to messages in your channel
-slackEvents.on('message', async (event) => {
-  try {
-    // Only process messages from your specific channel
-    if (event.channel !== CHANNEL_ID) return;
-    
-    // Ignore bot messages and message edits
-    if (event.subtype || event.bot_id) return;
-    
-    // Add message to buffer
-    conversationBuffer.addMessage({
+    // Store message in buffer
+    conversationBuffer.push({
       text: event.text,
       user: event.user,
       timestamp: event.ts
     });
 
-    console.log(`Message buffered. Total: ${conversationBuffer.getMessages().length}`);
-    
-    // Check if we should generate suggestions
-    const shouldGenerate = conversationBuffer.shouldGenerateSuggestions();
-    
-    if (shouldGenerate) {
-      await processSuggestions();
+    // Keep buffer size manageable
+    if (conversationBuffer.length > MAX_BUFFER_SIZE) {
+      conversationBuffer.shift();
     }
-    
+
+    messageCount++;
+    console.log(`📊 Message count: ${messageCount}/${MESSAGES_BEFORE_SUGGESTION} | Buffer size: ${conversationBuffer.length}`);
+
+    // Generate suggestions every N messages
+    if (messageCount >= MESSAGES_BEFORE_SUGGESTION) {
+      console.log('🎯 Triggering post suggestions...');
+      messageCount = 0;
+      await generateAndPostSuggestions(say, event.channel);
+    }
+
   } catch (error) {
-    console.error('Error handling message:', error);
+    console.error('❌ Error handling message:', error);
   }
 });
 
-// Handle Slack API errors
-slackEvents.on('error', (error) => {
-  console.error('Slack events error:', error);
-});
-
-// Process and send suggestions
-async function processSuggestions() {
+// Generate post suggestions using FREE Hugging Face API
+async function generatePostSuggestions(conversationText) {
   try {
-    const messages = conversationBuffer.getMessages();
+    // Using Hugging Face's FREE Inference API
+    // Model: Meta-Llama-3-8B-Instruct (completely free, no rate limits for basic usage)
+    const HF_API_URL = 'https://api-inference.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct';
     
-    if (messages.length === 0) {
-      console.log('No messages to process');
+    const prompt = `You are a social media content strategist. Based on the following conversation snippets, suggest 2 LinkedIn posts and 2 X (Twitter) posts.
+
+Conversation:
+${conversationText}
+
+Please provide:
+1. Two LinkedIn post ideas (professional, insightful, 100-200 words each)
+2. Two X post ideas (concise, engaging, under 280 characters each)
+
+Format your response clearly with sections: LINKEDIN POST 1, LINKEDIN POST 2, X POST 1, X POST 2`;
+
+    const response = await axios.post(
+      HF_API_URL,
+      {
+        inputs: prompt,
+        parameters: {
+          max_new_tokens: 800,
+          temperature: 0.7,
+          top_p: 0.95,
+          return_full_text: false
+        }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    return response.data[0].generated_text;
+  } catch (error) {
+    console.error('Error generating suggestions:', error.response?.data || error.message);
+    
+    // Fallback: Generate basic suggestions without AI
+    return `📝 **Post Suggestions Based on Recent Conversation**
+
+**LINKEDIN POST 1:**
+Just had an interesting discussion about ${conversationText.substring(0, 50)}... The key insight: [extract manually]. What's your experience with this?
+
+**LINKEDIN POST 2:**
+Reflecting on our product conversations today. One thing that stood out: [your insight here]. How do you approach similar challenges?
+
+**X POST 1:**
+Quick thought from today's discussion: ${conversationText.substring(0, 100)}... 🧵
+
+**X POST 2:**
+Building in public: ${conversationText.substring(0, 150)}...
+
+_Note: AI service temporarily unavailable. These are template suggestions._`;
+  }
+}
+
+// Post suggestions to Slack
+async function generateAndPostSuggestions(say, channel) {
+  try {
+    console.log('🔄 Starting suggestion generation...');
+    
+    // Combine recent messages into conversation text
+    const conversationText = conversationBuffer
+      .map(msg => msg.text)
+      .filter(text => text) // Remove undefined/null
+      .join('\n');
+
+    console.log(`📝 Conversation length: ${conversationText.length} characters`);
+    console.log(`📝 Conversation preview: ${conversationText.substring(0, 200)}...`);
+
+    // Lower threshold - just need ANY conversation
+    if (conversationText.length < 10) {
+      console.log('⚠️ Not enough conversation to generate suggestions (need at least 10 chars)');
+      await say('⚠️ Not enough conversation history yet. Send a few more messages first!');
       return;
     }
 
-    console.log(`Generating suggestions from ${messages.length} messages...`);
+    console.log('🤖 Calling Hugging Face API...');
     
-    const suggestions = await generatePostSuggestions(messages);
-    
-    // Post suggestions to Slack
-    await slackClient.chat.postMessage({
-      channel: CHANNEL_ID,
-      text: '📝 *Content Suggestions*',
-      blocks: formatSuggestionsMessage(suggestions)
+    // Generate suggestions
+    const suggestions = await generatePostSuggestions(conversationText);
+
+    console.log('✅ Suggestions generated, posting to Slack...');
+
+    // Post to Slack
+    await say({
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: '💡 Post Suggestions Ready!',
+            emoji: true
+          }
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `Based on your recent conversation, here are some post ideas:\n\n${suggestions}`
+          }
+        },
+        {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              text: '_Review and edit before posting. These are just suggestions!_ 📝'
+            }
+          ]
+        }
+      ]
     });
 
-    // Clear the buffer after processing
-    conversationBuffer.clear();
-    
-    console.log('Suggestions posted successfully');
-    
+    console.log('✅ Posted suggestions to Slack');
   } catch (error) {
-    console.error('Error processing suggestions:', error);
+    console.error('❌ Error posting suggestions:', error);
+    console.error('❌ Error details:', error.response?.data || error.message);
   }
 }
 
-// Format suggestions into Slack blocks
-function formatSuggestionsMessage(suggestions) {
-  const blocks = [
-    {
-      type: 'header',
-      text: {
-        type: 'plain_text',
-        text: '📝 Content Suggestions from Your Conversation',
-        emoji: true
-      }
-    },
-    {
-      type: 'divider'
+// Manual trigger command
+slackBot.command('/suggest-posts', async ({ command, ack, respond }) => {
+  try {
+    await ack();
+    console.log('🎯 Manual trigger: /suggest-posts command received');
+    
+    // Use respond instead of say for slash commands
+    await respond({
+      response_type: 'in_channel',
+      text: '🔄 Generating post suggestions...'
+    });
+    
+    // Generate suggestions
+    const conversationText = conversationBuffer
+      .map(msg => msg.text)
+      .filter(text => text) // Remove undefined/null
+      .join('\n');
+    
+    console.log(`📝 Buffer size: ${conversationBuffer.length} messages`);
+    console.log(`📝 Total text: ${conversationText.length} characters`);
+    
+    if (conversationText.length < 10) {
+      await respond({
+        response_type: 'in_channel',
+        text: `⚠️ Not enough conversation history yet. Buffer has ${conversationBuffer.length} messages with ${conversationText.length} characters. Send a few more messages first!`
+      });
+      return;
     }
-  ];
-
-  // Add LinkedIn suggestions
-  if (suggestions.linkedin && suggestions.linkedin.length > 0) {
-    blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: '*LinkedIn Posts:*'
-      }
-    });
-
-    suggestions.linkedin.forEach((post, index) => {
-      blocks.push({
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*${index + 1}.* ${post}`
+    
+    const suggestions = await generatePostSuggestions(conversationText);
+    
+    await respond({
+      response_type: 'in_channel',
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: '💡 Post Suggestions Ready!',
+            emoji: true
+          }
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `Based on your recent conversation, here are some post ideas:\n\n${suggestions}`
+          }
+        },
+        {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              text: '_Review and edit before posting. These are just suggestions!_ 📝'
+            }
+          ]
         }
-      });
-      blocks.push({ type: 'divider' });
+      ]
+    });
+    
+    console.log('✅ Slash command completed successfully');
+  } catch (error) {
+    console.error('❌ Error handling slash command:', error);
+    await respond({
+      response_type: 'ephemeral',
+      text: `❌ Error: ${error.message}`
     });
   }
+});
 
-  // Add X (Twitter) suggestions
-  if (suggestions.twitter && suggestions.twitter.length > 0) {
-    blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: '*X (Twitter) Posts:*'
-      }
-    });
+// Also allow triggering with a simple message
+slackBot.message('suggest posts', async ({ message, say }) => {
+  console.log('🎯 Manual trigger: "suggest posts" message received');
+  await generateAndPostSuggestions(say, message.channel);
+});
 
-    suggestions.twitter.forEach((post, index) => {
-      blocks.push({
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*${index + 1}.* ${post}`
-        }
-      });
-      blocks.push({ type: 'divider' });
-    });
-  }
-
-  blocks.push({
-    type: 'context',
-    elements: [{
-      type: 'mrkdwn',
-      text: '_Review and edit before posting. These are just suggestions based on your conversation._'
-    }]
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'running',
+    message: 'Slack Post Suggester Bot is active!',
+    bufferSize: conversationBuffer.length,
+    messagesUntilNextSuggestion: MESSAGES_BEFORE_SUGGESTION - messageCount
   });
-
-  return blocks;
-}
-
-// Scheduled check every few hours (configurable)
-const checkIntervalHours = process.env.CHECK_INTERVAL_HOURS || 4;
-const cronSchedule = `0 */${checkIntervalHours} * * *`; // Every X hours
-
-cron.schedule(cronSchedule, async () => {
-  console.log('Running scheduled suggestion check...');
-  
-  const messages = conversationBuffer.getMessages();
-  const minMessages = parseInt(process.env.MIN_MESSAGES_FOR_SUGGESTION || '15');
-  
-  if (messages.length >= minMessages) {
-    await processSuggestions();
-  } else {
-    console.log(`Not enough messages yet (${messages.length}/${minMessages})`);
-  }
 });
 
-// Start server
+// Start the Slack bot
+(async () => {
+  await slackBot.start();
+  console.log('⚡️ Slack bot is running!');
+})();
+
+// Start Express server
 app.listen(PORT, () => {
-  console.log(`🚀 Slack Content Suggester running on port ${PORT}`);
-  console.log(`📊 Monitoring channel: ${CHANNEL_ID}`);
-  console.log(`⏰ Scheduled checks: Every ${checkIntervalHours} hours`);
-  console.log(`📝 Minimum messages for suggestion: ${process.env.MIN_MESSAGES_FOR_SUGGESTION || 15}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  process.exit(0);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
