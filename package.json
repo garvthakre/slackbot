@@ -1,0 +1,25 @@
+{
+  "name": "slack-content-suggester",
+  "version": "1.0.0",
+  "description": "Slack bot that suggests LinkedIn and X posts from conversations",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["slack", "bot", "content", "ai"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@slack/web-api": "^7.0.0",
+    "@slack/events-api": "^3.0.1",
+    "@anthropic-ai/sdk": "^0.32.1",
+    "express": "^4.18.2",
+    "dotenv": "^16.4.1",
+    "body-parser": "^1.20.2",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
