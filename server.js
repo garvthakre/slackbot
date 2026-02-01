@@ -6,25 +6,19 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// LinkedIn API configuration
-const LINKEDIN_API_BASE = 'https://api.linkedin.com/v2';
-
-// X (Twitter) API configuration  
-const X_API_BASE = 'https://api.twitter.com/2';
-
 // Slack Bot Setup
 const slackBot = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: true, // Enable socket mode for easier development (no public URL needed)
+  socketMode: true,
   appToken: process.env.SLACK_APP_TOKEN,
 });
 
-// Store recent messages (in production, use Redis or MongoDB)
+// Store recent messages
 let conversationBuffer = [];
 const MAX_BUFFER_SIZE = 20;
 let messageCount = 0;
-const MESSAGES_BEFORE_SUGGESTION = 15; // Generate suggestions every 15 messages
+const MESSAGES_BEFORE_SUGGESTION = 15;
 
 // Keywords that indicate post-worthy content
 const TRIGGER_KEYWORDS = [
@@ -40,7 +34,7 @@ let stats = {
   totalMessages: 0,
   keywordMatches: 0,
   lastSuggestionTime: null,
-  postsUsed: 0  // Track how many suggestions got thumbs up
+  postsUsed: 0
 };
 
 // Check if message contains important keywords
@@ -50,25 +44,15 @@ function containsRelevantKeywords(text) {
   return TRIGGER_KEYWORDS.some(keyword => lowerText.includes(keyword));
 }
 
-// Listen to ALL messages (with detailed logging)
+// Listen to ALL messages
 slackBot.event('message', async ({ event, say }) => {
   try {
-    console.log('🔔 RAW MESSAGE EVENT RECEIVED!');
-    console.log('Event type:', event.type);
-    console.log('Event subtype:', event.subtype);
-    console.log('Event channel:', event.channel);
-    console.log('Event user:', event.user);
-    console.log('Event text:', event.text);
-    console.log('Full event:', JSON.stringify(event, null, 2));
-    
     // Ignore bot messages and other subtypes
     if (event.subtype && event.subtype === 'bot_message') {
-      console.log('🤖 Ignoring bot message');
       return;
     }
     
     if (event.subtype) {
-      console.log(`⚠️ Ignoring message with subtype: ${event.subtype}`);
       return;
     }
 
@@ -98,13 +82,13 @@ slackBot.event('message', async ({ event, say }) => {
     }
 
     messageCount++;
-    console.log(`📊 Message count: ${messageCount}/${MESSAGES_BEFORE_SUGGESTION} | Buffer size: ${conversationBuffer.length}`);
+    console.log(`📊 Message count: ${messageCount}/${MESSAGES_BEFORE_SUGGESTION}`);
 
     // Generate suggestions every N messages
     if (messageCount >= MESSAGES_BEFORE_SUGGESTION) {
       console.log('🎯 Triggering post suggestions...');
       messageCount = 0;
-      await generateAndPostSuggestions(say, event.channel);
+      await findSimilarPosts(say, event.channel);
     }
 
   } catch (error) {
@@ -112,70 +96,28 @@ slackBot.event('message', async ({ event, say }) => {
   }
 });
 
-// Generate post suggestions using FREE Hugging Face API
-async function generatePostSuggestions(conversationText) {
+// Extract topics from conversation using AI
+async function extractTopics(conversationText) {
   try {
-    // Using Hugging Face's FREE Inference API
-    // Model: Meta-Llama-3-8B-Instruct (completely free, no rate limits for basic usage)
     const HF_API_URL = 'https://api-inference.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct';
     
-    // Count messages with keywords
-    const relevantMessages = conversationBuffer.filter(msg => msg.hasKeywords).length;
-    const keywordContext = relevantMessages > 0 
-      ? `\n(${relevantMessages} messages contain product/business keywords - focus on these!)`
-      : '';
-    
-    const prompt = `You are a social media content strategist helping founders create authentic posts from their real conversations.
-
-Context: This is a conversation between co-founders discussing their startup.${keywordContext}
+    const prompt = `Analyze this conversation between co-founders and extract 3-5 key topics or themes they're discussing.
 
 Conversation:
 ${conversationText}
 
-Create engaging social media posts based on the MOST INTERESTING insights from this conversation:
+Return ONLY a JSON array of topics (no other text):
+["topic 1", "topic 2", "topic 3"]
 
-1. **LinkedIn Post 1** (150-250 words):
-   - Professional tone, share a learning or insight
-   - Start with a hook
-   - Add personal experience
-   - End with a question to engage readers
-
-2. **LinkedIn Post 2** (150-250 words):
-   - Different angle from Post 1
-   - Could be more tactical/how-to focused
-   - Include specific details or numbers if mentioned
-
-3. **X Post 1** (under 250 characters):
-   - Punchy, quotable insight
-   - Can use emojis strategically
-   - Should work standalone
-
-4. **X Post 2** (under 250 characters):
-   - Different topic from X Post 1
-   - Could be contrarian or thought-provoking
-   - Conversational tone
-
-Format EXACTLY like this:
-LINKEDIN POST 1:
-[post content]
-
-LINKEDIN POST 2:
-[post content]
-
-X POST 1:
-[post content]
-
-X POST 2:
-[post content]`;
+Topics should be specific search queries that would find relevant LinkedIn or X posts.`;
 
     const response = await axios.post(
       HF_API_URL,
       {
         inputs: prompt,
         parameters: {
-          max_new_tokens: 1000,
-          temperature: 0.8,
-          top_p: 0.95,
+          max_new_tokens: 200,
+          temperature: 0.3,
           return_full_text: false
         }
       },
@@ -187,226 +129,196 @@ X POST 2:
       }
     );
 
-    return response.data[0].generated_text;
-  } catch (error) {
-    console.error('Error generating suggestions:', error.response?.data || error.message);
+    const responseText = response.data[0].generated_text.trim();
     
-    // Fallback: Generate basic suggestions without AI
-    return `📝 **Post Suggestions Based on Recent Conversation**
-
-**LINKEDIN POST 1:**
-Just had an interesting discussion about ${conversationText.substring(0, 50)}... The key insight: [extract manually]. What's your experience with this?
-
-**LINKEDIN POST 2:**
-Reflecting on our product conversations today. One thing that stood out: [your insight here]. How do you approach similar challenges?
-
-**X POST 1:**
-Quick thought from today's discussion: ${conversationText.substring(0, 100)}... 🧵
-
-**X POST 2:**
-Building in public: ${conversationText.substring(0, 150)}...
-
-_Note: AI service temporarily unavailable. These are template suggestions._`;
-  }
-}
-
-// Function to post to LinkedIn and return the post URL
-async function postToLinkedIn(content) {
-  try {
-    if (!process.env.LINKEDIN_ACCESS_TOKEN || !process.env.LINKEDIN_PERSON_URN) {
-      console.log('⚠️ LinkedIn credentials not configured, skipping auto-post');
-      return null;
+    // Try to extract JSON array from response
+    const jsonMatch = responseText.match(/\[.*\]/s);
+    if (jsonMatch) {
+      const topics = JSON.parse(jsonMatch[0]);
+      return topics.slice(0, 5); // Max 5 topics
     }
-
-    const response = await axios.post(
-      `${LINKEDIN_API_BASE}/ugcPosts`,
-      {
-        author: process.env.LINKEDIN_PERSON_URN,
-        lifecycleState: 'PUBLISHED',
-        specificContent: {
-          'com.linkedin.ugc.ShareContent': {
-            shareCommentary: {
-              text: content
-            },
-            shareMediaCategory: 'NONE'
-          }
-        },
-        visibility: {
-          'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC'
-        }
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.LINKEDIN_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-          'X-Restli-Protocol-Version': '2.0.0'
-        }
-      }
-    );
-
-    // Extract post ID from response
-    const postId = response.data.id;
     
-    // Convert URN to actual LinkedIn URL
-    // Format: https://www.linkedin.com/feed/update/urn:li:share:POST_ID/
-    const postUrl = `https://www.linkedin.com/feed/update/${postId}/`;
+    // Fallback: extract keywords from conversation
+    return extractKeywordsFromText(conversationText);
     
-    console.log(`✅ Posted to LinkedIn: ${postUrl}`);
-    return postUrl;
   } catch (error) {
-    console.error('❌ Error posting to LinkedIn:', error.response?.data || error.message);
-    return null;
+    console.error('Error extracting topics:', error);
+    return extractKeywordsFromText(conversationText);
   }
 }
 
-// Function to post to X (Twitter) and return the tweet URL
-async function postToX(content) {
-  try {
-    if (!process.env.X_ACCESS_TOKEN || !process.env.X_USERNAME) {
-      console.log('⚠️ X (Twitter) credentials not configured, skipping auto-post');
-      return null;
-    }
-
-    const response = await axios.post(
-      `${X_API_BASE}/tweets`,
-      {
-        text: content
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.X_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    const tweetId = response.data.data.id;
-    const tweetUrl = `https://twitter.com/${process.env.X_USERNAME}/status/${tweetId}`;
-    
-    console.log(`✅ Posted to X: ${tweetUrl}`);
-    return tweetUrl;
-  } catch (error) {
-    console.error('❌ Error posting to X:', error.response?.data || error.message);
-    return null;
-  }
+// Fallback method to extract keywords
+function extractKeywordsFromText(text) {
+  const words = text.toLowerCase().split(/\s+/);
+  const keywords = words.filter(word => 
+    TRIGGER_KEYWORDS.includes(word) && word.length > 4
+  );
+  
+  // Get unique keywords and take top 3
+  const uniqueKeywords = [...new Set(keywords)];
+  return uniqueKeywords.slice(0, 3).map(k => `${k} startup`);
 }
 
-// Parse AI suggestions and auto-post them
-async function parseAndPostSuggestions(aiResponse) {
-  const posts = {
+// Search for posts on multiple platforms
+async function searchPosts(topic) {
+  const results = {
     linkedin: [],
     x: []
   };
 
-  // Extract LinkedIn posts
-  const linkedinMatch1 = aiResponse.match(/LINKEDIN POST 1:\s*([\s\S]*?)(?=LINKEDIN POST 2:|X POST|$)/i);
-  const linkedinMatch2 = aiResponse.match(/LINKEDIN POST 2:\s*([\s\S]*?)(?=X POST|$)/i);
-  
-  // Extract X posts
-  const xMatch1 = aiResponse.match(/X POST 1:\s*([\s\S]*?)(?=X POST 2:|$)/i);
-  const xMatch2 = aiResponse.match(/X POST 2:\s*([\s\S]*?)$/i);
+  try {
+    // Search LinkedIn using Google (since LinkedIn API is restricted)
+    const linkedinQuery = encodeURIComponent(`site:linkedin.com/posts ${topic}`);
+    const linkedinResults = await searchGoogle(linkedinQuery, 'LinkedIn');
+    results.linkedin = linkedinResults;
 
-  // Post to LinkedIn if auto-posting is enabled
-  const autoPost = process.env.AUTO_POST_ENABLED === 'true';
-  
-  if (linkedinMatch1) {
-    const content = linkedinMatch1[1].trim();
-    const url = autoPost ? await postToLinkedIn(content) : null;
-    posts.linkedin.push({ content, url });
+    // Search X/Twitter
+    const xQuery = encodeURIComponent(`site:twitter.com OR site:x.com ${topic}`);
+    const xResults = await searchGoogle(xQuery, 'X/Twitter');
+    results.x = xResults;
+
+  } catch (error) {
+    console.error('Error searching posts:', error);
   }
 
-  if (linkedinMatch2) {
-    const content = linkedinMatch2[1].trim();
-    const url = autoPost ? await postToLinkedIn(content) : null;
-    posts.linkedin.push({ content, url });
-  }
-
-  if (xMatch1) {
-    const content = xMatch1[1].trim();
-    const url = autoPost ? await postToX(content) : null;
-    posts.x.push({ content, url });
-  }
-
-  if (xMatch2) {
-    const content = xMatch2[1].trim();
-    const url = autoPost ? await postToX(content) : null;
-    posts.x.push({ content, url });
-  }
-
-  return posts;
+  return results;
 }
 
-// Post suggestions to Slack
-async function generateAndPostSuggestions(say, channel) {
+// Use Google Custom Search API or SerpAPI to find posts
+async function searchGoogle(query, platform) {
   try {
-    console.log('🔄 Starting suggestion generation...');
+    // Option 1: Using SerpAPI (free tier available)
+    if (process.env.SERPAPI_KEY) {
+      const response = await axios.get('https://serpapi.com/search', {
+        params: {
+          q: query,
+          api_key: process.env.SERPAPI_KEY,
+          num: 3 // Get top 3 results
+        }
+      });
+
+      return response.data.organic_results?.slice(0, 3).map(result => ({
+        title: result.title,
+        snippet: result.snippet,
+        url: result.link,
+        platform: platform
+      })) || [];
+    }
+
+    // Option 2: Using Google Custom Search API
+    if (process.env.GOOGLE_SEARCH_API_KEY && process.env.GOOGLE_SEARCH_ENGINE_ID) {
+      const response = await axios.get('https://www.googleapis.com/customsearch/v1', {
+        params: {
+          key: process.env.GOOGLE_SEARCH_API_KEY,
+          cx: process.env.GOOGLE_SEARCH_ENGINE_ID,
+          q: query,
+          num: 3
+        }
+      });
+
+      return response.data.items?.slice(0, 3).map(item => ({
+        title: item.title,
+        snippet: item.snippet,
+        url: item.link,
+        platform: platform
+      })) || [];
+    }
+
+    // Fallback: Return generic search links
+    return [{
+      title: `Search ${platform} for: ${decodeURIComponent(query)}`,
+      snippet: 'Click to search for similar posts',
+      url: platform === 'LinkedIn' 
+        ? `https://www.linkedin.com/search/results/content/?keywords=${query}`
+        : `https://twitter.com/search?q=${query}`,
+      platform: platform
+    }];
+
+  } catch (error) {
+    console.error(`Error searching ${platform}:`, error.message);
+    return [];
+  }
+}
+
+// Find and suggest similar posts
+async function findSimilarPosts(say, channel) {
+  try {
+    console.log('🔄 Finding similar posts...');
     
     // Combine recent messages into conversation text
     const conversationText = conversationBuffer
       .map(msg => msg.text)
-      .filter(text => text) // Remove undefined/null
+      .filter(text => text)
       .join('\n');
 
-    console.log(`📝 Conversation length: ${conversationText.length} characters`);
-    console.log(`📝 Conversation preview: ${conversationText.substring(0, 200)}...`);
-
-    // Lower threshold - just need ANY conversation
     if (conversationText.length < 10) {
-      console.log('⚠️ Not enough conversation to generate suggestions (need at least 10 chars)');
       await say('⚠️ Not enough conversation history yet. Send a few more messages first!');
       return;
     }
 
-    console.log('🤖 Calling Hugging Face API...');
-    
+    await say('🔍 Analyzing your conversation and finding similar posts...');
+
+    // Extract topics from conversation
+    console.log('📊 Extracting topics...');
+    const topics = await extractTopics(conversationText);
+    console.log('Topics extracted:', topics);
+
     // Track suggestion generation
     stats.totalSuggestions++;
     stats.lastSuggestionTime = new Date().toISOString();
-    
-    // Generate suggestions
-    const aiResponse = await generatePostSuggestions(conversationText);
-    
-    console.log('✅ Suggestions generated!');
-    console.log('📤 Parsing and posting to social media...');
-    
-    // Parse and auto-post suggestions
-    const posts = await parseAndPostSuggestions(aiResponse);
 
-    console.log('✅ Posts processed, sending to Slack...');
+    // Search for posts on each topic
+    const allResults = {
+      linkedin: [],
+      x: []
+    };
 
-    // Build formatted message with posts and links
-    let formattedMessage = '*Based on your recent conversation:*\n\n';
+    for (const topic of topics) {
+      console.log(`🔍 Searching for: ${topic}`);
+      const results = await searchPosts(topic);
+      allResults.linkedin.push(...results.linkedin);
+      allResults.x.push(...results.x);
+    }
+
+    // Remove duplicates
+    allResults.linkedin = removeDuplicates(allResults.linkedin);
+    allResults.x = removeDuplicates(allResults.x);
+
+    console.log(`Found ${allResults.linkedin.length} LinkedIn posts, ${allResults.x.length} X posts`);
+
+    // Build formatted message
+    let formattedMessage = `*Based on your discussion about:* ${topics.join(', ')}\n\n`;
     
-    // LinkedIn Posts
-    formattedMessage += '*📘 LINKEDIN POSTS*\n\n';
-    posts.linkedin.forEach((post, index) => {
-      formattedMessage += `*Post ${index + 1}:*\n${post.content}\n`;
-      if (post.url) {
-        formattedMessage += `🔗 <${post.url}|View on LinkedIn>\n\n`;
-      } else {
-        formattedMessage += `_Not posted (auto-posting disabled or failed)_\n\n`;
-      }
-    });
+    if (allResults.linkedin.length > 0) {
+      formattedMessage += '*📘 SIMILAR LINKEDIN POSTS*\n\n';
+      allResults.linkedin.slice(0, 5).forEach((post, index) => {
+        formattedMessage += `${index + 1}. *${post.title}*\n`;
+        formattedMessage += `   ${post.snippet}\n`;
+        formattedMessage += `   🔗 <${post.url}|View Post>\n\n`;
+      });
+    }
 
-    // X Posts
-    formattedMessage += '*🐦 X (TWITTER) POSTS*\n\n';
-    posts.x.forEach((post, index) => {
-      formattedMessage += `*Post ${index + 1}:*\n${post.content}\n`;
-      if (post.url) {
-        formattedMessage += `🔗 <${post.url}|View on X>\n\n`;
-      } else {
-        formattedMessage += `_Not posted (auto-posting disabled or failed)_\n\n`;
-      }
-    });
+    if (allResults.x.length > 0) {
+      formattedMessage += '*🐦 SIMILAR X/TWITTER POSTS*\n\n';
+      allResults.x.slice(0, 5).forEach((post, index) => {
+        formattedMessage += `${index + 1}. *${post.title}*\n`;
+        formattedMessage += `   ${post.snippet}\n`;
+        formattedMessage += `   🔗 <${post.url}|View Post>\n\n`;
+      });
+    }
 
-    // Post to Slack with formatted message
+    if (allResults.linkedin.length === 0 && allResults.x.length === 0) {
+      formattedMessage += '_No similar posts found. Try discussing more specific topics!_';
+    }
+
+    // Post to Slack
     await say({
       blocks: [
         {
           type: 'header',
           text: {
             type: 'plain_text',
-            text: '💡 Post Suggestions Ready!',
+            text: '🔍 Similar Posts Found!',
             emoji: true
           }
         },
@@ -425,9 +337,7 @@ async function generateAndPostSuggestions(say, channel) {
           elements: [
             {
               type: 'mrkdwn',
-              text: process.env.AUTO_POST_ENABLED === 'true' 
-                ? '_✅ Posts automatically published! Click links to view._'
-                : '_💡 Tip: Enable AUTO_POST_ENABLED in .env to auto-publish posts. For now, copy and paste manually._'
+              text: '_💡 These posts discuss similar topics to your conversation. Click to read and get inspired!_'
             }
           ]
         }
@@ -436,9 +346,21 @@ async function generateAndPostSuggestions(say, channel) {
 
     console.log('✅ Posted suggestions to Slack');
   } catch (error) {
-    console.error('❌ Error posting suggestions:', error);
-    console.error('❌ Error details:', error.response?.data || error.message);
+    console.error('❌ Error finding posts:', error);
+    await say(`❌ Error finding similar posts: ${error.message}`);
   }
+}
+
+// Remove duplicate URLs
+function removeDuplicates(posts) {
+  const seen = new Set();
+  return posts.filter(post => {
+    if (seen.has(post.url)) {
+      return false;
+    }
+    seen.add(post.url);
+    return true;
+  });
 }
 
 // Manual trigger command
@@ -447,105 +369,27 @@ slackBot.command('/suggest-posts', async ({ command, ack, respond }) => {
     await ack();
     console.log('🎯 Manual trigger: /suggest-posts command received');
     
-    // Use respond instead of say for slash commands
-    await respond({
-      response_type: 'in_channel',
-      text: '🔄 Generating post suggestions...'
-    });
-    
-    // Generate suggestions
     const conversationText = conversationBuffer
       .map(msg => msg.text)
-      .filter(text => text) // Remove undefined/null
+      .filter(text => text)
       .join('\n');
-    
-    console.log(`📝 Buffer size: ${conversationBuffer.length} messages`);
-    console.log(`📝 Total text: ${conversationText.length} characters`);
     
     if (conversationText.length < 10) {
       await respond({
         response_type: 'in_channel',
-        text: `⚠️ Not enough conversation history yet. Buffer has ${conversationBuffer.length} messages with ${conversationText.length} characters. Send a few more messages first!`
+        text: '⚠️ Not enough conversation history yet. Send a few more messages first!'
       });
       return;
     }
-    
-    const suggestions = await generatePostSuggestions(conversationText);
-    
+
     await respond({
       response_type: 'in_channel',
-      blocks: [
-        {
-          type: 'header',
-          text: {
-            type: 'plain_text',
-            text: '💡 Post Suggestions Ready!',
-            emoji: true
-          }
-        },
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `Based on your recent conversation, here are some post ideas:\n\n${suggestions}`
-          }
-        },
-        {
-          type: 'divider'
-        },
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: '*📝 Quick Actions:*'
-          }
-        },
-        {
-          type: 'actions',
-          elements: [
-            {
-              type: 'button',
-              text: {
-                type: 'plain_text',
-                text: '🔗 Post on LinkedIn',
-                emoji: true
-              },
-              url: 'https://www.linkedin.com/feed/',
-              style: 'primary'
-            },
-            {
-              type: 'button',
-              text: {
-                type: 'plain_text',
-                text: '🐦 Post on X',
-                emoji: true
-              },
-              url: 'https://twitter.com/compose/tweet'
-            },
-            {
-              type: 'button',
-              text: {
-                type: 'plain_text',
-                text: '📊 View Stats',
-                emoji: true
-              },
-              action_id: 'view_stats'
-            }
-          ]
-        },
-        {
-          type: 'context',
-          elements: [
-            {
-              type: 'mrkdwn',
-              text: '_💡 Tip: Copy the post you like, click the button, and paste! React with 👍 if you used one._'
-            }
-          ]
-        }
-      ]
+      text: '🔍 Searching for similar posts...'
     });
+
+    // Trigger the search (this will post results separately)
+    await findSimilarPosts(respond, command.channel_id);
     
-    console.log('✅ Slash command completed successfully');
   } catch (error) {
     console.error('❌ Error handling slash command:', error);
     await respond({
@@ -558,7 +402,12 @@ slackBot.command('/suggest-posts', async ({ command, ack, respond }) => {
 // Also allow triggering with a simple message
 slackBot.message('suggest posts', async ({ message, say }) => {
   console.log('🎯 Manual trigger: "suggest posts" message received');
-  await generateAndPostSuggestions(say, message.channel);
+  await findSimilarPosts(say, message.channel);
+});
+
+slackBot.message('find similar posts', async ({ message, say }) => {
+  console.log('🎯 Manual trigger: "find similar posts" message received');
+  await findSimilarPosts(say, message.channel);
 });
 
 // Stats command
@@ -566,16 +415,9 @@ slackBot.message('bot stats', async ({ say }) => {
   await sendStatsMessage(say);
 });
 
-// Handle button clicks
-slackBot.action('view_stats', async ({ ack, say }) => {
-  await ack();
-  await sendStatsMessage(say);
-});
-
-// Track reactions on suggestion messages
+// Track reactions
 slackBot.event('reaction_added', async ({ event }) => {
   try {
-    // If someone reacts with thumbs up to a bot message, count it as "used"
     if (event.reaction === '+1' || event.reaction === 'thumbsup') {
       stats.postsUsed++;
       console.log(`👍 Post marked as used! Total used: ${stats.postsUsed}`);
@@ -614,7 +456,7 @@ async function sendStatsMessage(say) {
           },
           {
             type: 'mrkdwn',
-            text: `*Suggestions Generated:*\n${stats.totalSuggestions}`
+            text: `*Searches Performed:*\n${stats.totalSuggestions}`
           },
           {
             type: 'mrkdwn',
@@ -630,7 +472,7 @@ async function sendStatsMessage(say) {
           },
           {
             type: 'mrkdwn',
-            text: `*Next in:*\n${MESSAGES_BEFORE_SUGGESTION - messageCount} messages`
+            text: `*Next Search in:*\n${MESSAGES_BEFORE_SUGGESTION - messageCount} messages`
           }
         ]
       },
@@ -639,7 +481,7 @@ async function sendStatsMessage(say) {
         elements: [
           {
             type: 'mrkdwn',
-            text: `_Last suggestion: ${stats.lastSuggestionTime ? new Date(stats.lastSuggestionTime).toLocaleString() : 'Never'}_`
+            text: `_Last search: ${stats.lastSuggestionTime ? new Date(stats.lastSuggestionTime).toLocaleString() : 'Never'}_`
           }
         ]
       }
@@ -651,15 +493,15 @@ async function sendStatsMessage(say) {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
-    message: 'Slack Post Suggester Bot is active!',
+    message: 'Slack Similar Post Finder Bot is active!',
     stats: {
       totalMessages: stats.totalMessages,
-      totalSuggestions: stats.totalSuggestions,
+      totalSearches: stats.totalSuggestions,
       postsUsed: stats.postsUsed,
       keywordMatches: stats.keywordMatches,
       bufferSize: conversationBuffer.length,
       messagesUntilNext: MESSAGES_BEFORE_SUGGESTION - messageCount,
-      lastSuggestion: stats.lastSuggestionTime
+      lastSearch: stats.lastSuggestionTime
     }
   });
 });
@@ -668,6 +510,7 @@ app.get('/', (req, res) => {
 (async () => {
   await slackBot.start();
   console.log('⚡️ Slack bot is running!');
+  console.log('🔍 Will search for similar posts based on your conversations');
 })();
 
 // Start Express server
