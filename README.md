@@ -1,5 +1,7 @@
 # Slack Content Suggester Bot
 
+https://github.com/user-attachments/assets/169d8b07-4cde-4b94-9702-067c851d9ebf
+
 A Slack bot that listens to your conversations and helps you find similar posts or generate content ideas for LinkedIn and X (Twitter).
 
 ## What it does
