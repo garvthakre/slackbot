@@ -53,4 +53,4 @@ The bot auto-detects relevant conversations and offers options. You can also use
 
 ---
 
-Built with Claude AI and Slack Bolt
+ 
